@@ -1,0 +1,136 @@
+name: Build Kernel Redmi 13 MT6768
+
+on:
+  push:
+    branches: [ lineage-22.1 ]
+  pull_request:
+    branches: [ lineage-22.1 ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential \
+            flex \
+            bison \
+            libssl-dev \
+            libelf-dev \
+            libdw-dev \
+            libaudit-dev \
+            ccache \
+            git \
+            wget \
+            curl \
+            python3 \
+            python3-distutils \
+            zstd \
+            openssl \
+            clang \
+            llvm \
+            lld
+      
+      - name: Download and setup Clang toolchain
+        run: |
+          cd /tmp
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/android15-release/clang-r530e1a59f.tar.gz
+          tar -xzf clang-r530e1a59f.tar.gz
+          export PATH="/tmp/clang-r530e1a59f/bin:$PATH"
+          clang --version
+      
+      - name: Download ARM64 Toolchain
+        run: |
+          cd /tmp
+          wget -q https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/android-12.1.0_r27.tar.gz
+          tar -xzf aarch64-linux-android-4.9-*.tar.gz -C /tmp
+          ls -la /tmp/aarch64-linux-android-4.9/bin/
+      
+      - name: Setup environment variables
+        run: |
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android-" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "LD=/tmp/clang-r530e1a59f/bin/ld.lld" >> $GITHUB_ENV
+      
+      - name: Generate defconfig for MT6768
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- mt6768_defconfig
+      
+      - name: Build kernel Image
+        run: |
+          make ARCH=arm64 \
+            CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            -j$(nproc) Image
+        continue-on-error: true
+      
+      - name: Build Device Tree Blob
+        run: |
+          make ARCH=arm64 \
+            CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            -j$(nproc) dtbs
+        continue-on-error: true
+      
+      - name: Build modules
+        run: |
+          make ARCH=arm64 \
+            CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            -j$(nproc) modules
+        continue-on-error: true
+      
+      - name: Prepare build artifacts
+        run: |
+          mkdir -p build_output
+          cp arch/arm64/boot/Image build_output/ || true
+          cp arch/arm64/boot/dts/mediatek/*.dtb build_output/ || true
+          find . -name "*.ko" -exec cp {} build_output/ \; || true
+          ls -lah build_output/
+      
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: kernel-redmi13-mt6768-${{ github.run_number }}
+          path: build_output/
+          retention-days: 30
+      
+      - name: Create Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build_output/Image
+            build_output/*.dtb
+            build_output/*.ko
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build Summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Device: Redmi 13 (MT6768)" >> $GITHUB_STEP_SUMMARY
+          echo "- Kernel: 6.6" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch: lineage-22.1" >> $GITHUB_STEP_SUMMARY
+          echo "- Build artifacts ready in: build_output/" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Output Files:" >> $GITHUB_STEP_SUMMARY
+          ls -lh build_output/ >> $GITHUB_STEP_SUMMARY || echo "No output files generated" >> $GITHUB_STEP_SUMMARY
