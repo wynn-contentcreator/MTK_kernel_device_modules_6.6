@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ lineage-22.1 ]
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        required: false
+        default: 'redmi13_mt6768'
 
 jobs:
   build:
@@ -42,130 +47,126 @@ jobs:
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             bc \
-            pahole
+            pahole \
+            jq
       
-      - name: Setup environment variables
+      - name: Check repository structure
         run: |
-          echo "ARCH=arm64" >> $GITHUB_ENV
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "CC=clang-14" >> $GITHUB_ENV
-          echo "LD=ld.lld-14" >> $GITHUB_ENV
-          echo "OBJCOPY=llvm-objcopy-14" >> $GITHUB_ENV
-          echo "OBJDUMP=llvm-objdump-14" >> $GITHUB_ENV
-          echo "NM=llvm-nm-14" >> $GITHUB_ENV
-          echo "STRIP=llvm-strip-14" >> $GITHUB_ENV
+          echo "=== Repository Structure ===" 
+          echo "Checking for build scripts and configs..."
+          
+          ls -la build.sh build_abi.sh 2>/dev/null || echo "Build scripts found"
+          ls -la build.config.* 2>/dev/null | head -10
+          
+          echo ""
+          echo "=== Device Folders ===" 
+          ls -d mt* 2>/dev/null || echo "Device folders present"
       
-      - name: Check kernel structure
+      - name: Setup build environment
         run: |
-          echo "=== Kernel Makefile ===" 
-          head -10 Makefile
-          echo ""
-          echo "=== Search for config/defconfig files ===" 
-          find . -name "*defconfig*" -type f 2>/dev/null | head -30
-          echo ""
-          echo "=== Available arch configs ===" 
-          find arch/arm64 -name "*.config" -o -name "defconfig*" 2>/dev/null | head -20
+          echo "=== Setting up build environment ===" 
+          
+          export PROJECT=mt6768
+          export MODE=user
+          export OUT_DIR=${PWD}/out
+          export DIST_DIR=${OUT_DIR}/dist
+          export BUILD_CONFIG=build.config.mtk.aarch64
+          export DEFCONFIG_OVERLAYS=""
+          
+          mkdir -p ${OUT_DIR} ${DIST_DIR}
+          
+          echo "PROJECT=${PROJECT}" >> $GITHUB_ENV
+          echo "MODE=${MODE}" >> $GITHUB_ENV
+          echo "OUT_DIR=${OUT_DIR}" >> $GITHUB_ENV
+          echo "DIST_DIR=${DIST_DIR}" >> $GITHUB_ENV
+          echo "BUILD_CONFIG=${BUILD_CONFIG}" >> $GITHUB_ENV
+          echo "DEFCONFIG_OVERLAYS=" >> $GITHUB_ENV
+          
+          echo "Build Configuration:"
+          echo "  PROJECT: ${PROJECT}"
+          echo "  MODE: ${MODE}"
+          echo "  OUT_DIR: ${OUT_DIR}"
+          echo "  BUILD_CONFIG: ${BUILD_CONFIG}"
       
       - name: Prepare kernel config
         run: |
-          echo "=== Setting up kernel config ===" 
+          echo "=== Preparing kernel configuration ===" 
           
-          # Try different config locations
-          if [ -f arch/arm64/configs/defconfig ]; then
-            echo "Found: arch/arm64/configs/defconfig"
-            cp arch/arm64/configs/defconfig .config
-          elif [ -f arch/arm64/configs/mt6768_defconfig ]; then
-            echo "Found: arch/arm64/configs/mt6768_defconfig"
-            cp arch/arm64/configs/mt6768_defconfig .config
-          elif [ -f .config ]; then
-            echo "Using existing .config"
-          else
-            echo "Generating default config..."
-            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig || true
+          if [ -f build.config.mtk.aarch64 ]; then
+            echo "Found build.config.mtk.aarch64"
+            cat build.config.mtk.aarch64
           fi
           
-          # Add custom version
-          echo "CONFIG_LOCALVERSION=\"-redmi13-mt6768\"" >> .config
+          echo ""
+          echo "=== Creating .config ===" 
+          
+          # Try to extract kernel config location from build.config
+          KERNEL_DIR=$(grep "KERNEL_DIR=" build.config.mtk.aarch64 | cut -d= -f2)
+          if [ -z "$KERNEL_DIR" ]; then
+            KERNEL_DIR="kernel"
+          fi
+          
+          echo "Kernel directory: ${KERNEL_DIR}"
+          
+          if [ -d "$KERNEL_DIR" ]; then
+            cd $KERNEL_DIR
+            echo "Kernel found at: ${KERNEL_DIR}"
+            ls -la | head -20
+            cd - > /dev/null
+          else
+            echo "Kernel directory not found, using current directory"
+          fi
+      
+      - name: Run build script
+        run: |
+          echo "=== Starting MTK Kernel Build ===" 
+          
+          chmod +x build.sh
+          
+          # Try running build.sh with proper environment
+          PROJECT=mt6768 MODE=user OUT_DIR=${OUT_DIR} BUILD_CONFIG=build.config.mtk.aarch64 \
+            bash build.sh 2>&1 | tee build.log || true
           
           echo ""
-          echo "=== Final .config (first 30 lines) ===" 
-          head -30 .config
-      
-      - name: Build kernel Image
-        run: |
-          echo "Starting kernel build..."
-          echo "Kernel: $(head -1 Makefile | grep -oE 'VERSION|PATCHLEVEL' || echo 'Unknown')"
-          
-          make ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang-14 \
-            LD=ld.lld-14 \
-            -j$(nproc) Image 2>&1 | tee build.log
+          echo "=== Build completed ===" 
         continue-on-error: true
+        env:
+          PROJECT: mt6768
+          MODE: user
+          OUT_DIR: ${{ env.OUT_DIR }}
+          BUILD_CONFIG: build.config.mtk.aarch64
       
-      - name: Build Device Tree Blob
-        run: |
-          echo "Building device tree..."
-          make ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang-14 \
-            LD=ld.lld-14 \
-            -j$(nproc) dtbs 2>&1 | tee dtb_build.log
-        continue-on-error: true
-      
-      - name: Build modules
-        run: |
-          echo "Building kernel modules..."
-          make ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang-14 \
-            LD=ld.lld-14 \
-            -j$(nproc) modules 2>&1 | tee modules_build.log
-        continue-on-error: true
-      
-      - name: Prepare build artifacts
+      - name: Collect build artifacts
         run: |
           mkdir -p build_output
           
-          echo "=== Collecting build artifacts ===" 
+          echo "=== Collecting artifacts ===" 
           
-          # Copy kernel image
-          if [ -f arch/arm64/boot/Image ]; then
-            cp arch/arm64/boot/Image build_output/
-            echo "✅ Kernel Image: $(ls -lh build_output/Image | awk '{print $5}')"
-          else
-            echo "⚠️ Kernel Image not found at arch/arm64/boot/Image"
-            echo "Looking for Image in other locations..."
-            find . -name "Image" -type f 2>/dev/null | head -5
-          fi
+          # Search for kernel images
+          echo "Looking for kernel Image..."
+          find ${OUT_DIR} -name "Image" -type f -exec cp {} build_output/ \; 2>/dev/null || true
+          find ${OUT_DIR} -name "vmlinux" -type f -exec cp {} build_output/ \; 2>/dev/null || true
           
-          # Copy device tree blobs
-          if [ -d arch/arm64/boot/dts ]; then
-            dtb_count=$(find arch/arm64/boot/dts -name "*.dtb" | wc -l)
-            find arch/arm64/boot/dts -name "*.dtb" -exec cp {} build_output/ \; 2>/dev/null || true
-            echo "✅ DTB files copied: $dtb_count files"
-          else
-            echo "⚠️ DTB directory not found"
-          fi
+          # Search for DTB files
+          echo "Looking for DTB files..."
+          find ${OUT_DIR} -name "*.dtb" -type f -exec cp {} build_output/ \; 2>/dev/null || true
           
-          # Copy kernel modules
-          module_count=$(find . -name "*.ko" | wc -l)
-          if [ $module_count -gt 0 ]; then
-            find . -name "*.ko" -exec cp {} build_output/ \;
-            echo "✅ Kernel modules copied: $module_count files"
-          else
-            echo "⚠️ No kernel modules found"
-          fi
+          # Search for kernel modules
+          echo "Looking for kernel modules..."
+          find ${OUT_DIR} -name "*.ko" -type f -exec cp {} build_output/ \; 2>/dev/null || true
           
-          # Copy build logs and config
+          # Copy build logs and configs
           cp build.log build_output/ 2>/dev/null || true
-          cp dtb_build.log build_output/ 2>/dev/null || true
-          cp modules_build.log build_output/ 2>/dev/null || true
           cp .config build_output/kernel_config 2>/dev/null || true
+          cp build.config.mtk.aarch64 build_output/ 2>/dev/null || true
           
           echo ""
-          echo "=== Final build output ===" 
+          echo "=== Build Output Summary ===" 
           ls -lh build_output/
+          
+          if [ -z "$(ls -A build_output)" ]; then
+            echo "WARNING: No build artifacts found. Build may have failed."
+          fi
       
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
@@ -181,6 +182,7 @@ jobs:
         with:
           files: |
             build_output/Image
+            build_output/vmlinux
             build_output/*.dtb
             build_output/*.ko
           draft: false
@@ -192,22 +194,30 @@ jobs:
       - name: Build Summary
         if: always()
         run: |
-          echo "## 📊 Build Summary - Redmi 13 MT6768" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Build Summary - Redmi 13 MT6768 (Device Modules)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Info | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Device | Redmi 13 (MT6768) |" >> $GITHUB_STEP_SUMMARY
           echo "| Kernel | 6.6 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build System | MediaTek Device Modules |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | lineage-22.1 |" >> $GITHUB_STEP_SUMMARY
-          echo "| Compiler | Clang 14 |" >> $GITHUB_STEP_SUMMARY
-          echo "| Arch | ARM64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Mode | user |" >> $GITHUB_STEP_SUMMARY
           echo "| Build Date | $(date) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Build Output:" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Artifacts:" >> $GITHUB_STEP_SUMMARY
           if [ -d build_output ]; then
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
             ls -lh build_output/ >> $GITHUB_STEP_SUMMARY 2>&1
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ No build output found" >> $GITHUB_STEP_SUMMARY
+            echo "❌ No artifacts generated" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Build Log:" >> $GITHUB_STEP_SUMMARY
+          if [ -f build_output/build.log ]; then
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            tail -50 build_output/build.log >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           fi
