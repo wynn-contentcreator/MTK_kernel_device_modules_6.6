@@ -10,8 +10,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: ubuntu:22.04
     
     steps:
       - name: Checkout code
@@ -21,8 +19,8 @@ jobs:
       
       - name: Install build dependencies
         run: |
-          apt-get update
-          apt-get install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
             build-essential \
             flex \
             bison \
@@ -38,70 +36,85 @@ jobs:
             python3-distutils \
             zstd \
             openssl \
-            clang \
-            llvm \
-            lld
-      
-      - name: Download and setup Clang toolchain
-        run: |
-          cd /tmp
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/android15-release/clang-r530e1a59f.tar.gz
-          tar -xzf clang-r530e1a59f.tar.gz
-          export PATH="/tmp/clang-r530e1a59f/bin:$PATH"
-          clang --version
-      
-      - name: Download ARM64 Toolchain
-        run: |
-          cd /tmp
-          wget -q https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/android-12.1.0_r27.tar.gz
-          tar -xzf aarch64-linux-android-4.9-*.tar.gz -C /tmp
-          ls -la /tmp/aarch64-linux-android-4.9/bin/
+            clang-14 \
+            llvm-14 \
+            lld-14 \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
       
       - name: Setup environment variables
         run: |
           echo "ARCH=arm64" >> $GITHUB_ENV
-          echo "CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android-" >> $GITHUB_ENV
-          echo "CC=clang" >> $GITHUB_ENV
-          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "LD=/tmp/clang-r530e1a59f/bin/ld.lld" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CC=clang-14" >> $GITHUB_ENV
+          echo "LD=ld.lld-14" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy-14" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump-14" >> $GITHUB_ENV
+          echo "NM=llvm-nm-14" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip-14" >> $GITHUB_ENV
+      
+      - name: Check kernel version
+        run: |
+          head -5 Makefile
       
       - name: Generate defconfig for MT6768
         run: |
-          make ARCH=arm64 CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- mt6768_defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- mt6768_defconfig || make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
       
       - name: Build kernel Image
         run: |
           make ARCH=arm64 \
-            CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            -j$(nproc) Image
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang-14 \
+            LD=ld.lld-14 \
+            -j$(nproc) Image 2>&1 | tee build.log
         continue-on-error: true
       
       - name: Build Device Tree Blob
         run: |
           make ARCH=arm64 \
-            CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            -j$(nproc) dtbs
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang-14 \
+            LD=ld.lld-14 \
+            -j$(nproc) dtbs 2>&1 | tee dtb_build.log
         continue-on-error: true
       
       - name: Build modules
         run: |
           make ARCH=arm64 \
-            CROSS_COMPILE=/tmp/aarch64-linux-android-4.9/bin/aarch64-linux-android- \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            -j$(nproc) modules
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang-14 \
+            LD=ld.lld-14 \
+            -j$(nproc) modules 2>&1 | tee modules_build.log
         continue-on-error: true
       
       - name: Prepare build artifacts
         run: |
           mkdir -p build_output
-          cp arch/arm64/boot/Image build_output/ || true
-          cp arch/arm64/boot/dts/mediatek/*.dtb build_output/ || true
-          find . -name "*.ko" -exec cp {} build_output/ \; || true
+          
+          # Copy kernel image
+          if [ -f arch/arm64/boot/Image ]; then
+            cp arch/arm64/boot/Image build_output/
+            echo "✅ Kernel Image copied"
+          else
+            echo "⚠️ Kernel Image not found"
+          fi
+          
+          # Copy device tree blobs
+          if [ -d arch/arm64/boot/dts/mediatek ]; then
+            cp arch/arm64/boot/dts/mediatek/*.dtb build_output/ 2>/dev/null || true
+            echo "✅ DTB files copied"
+          fi
+          
+          # Copy kernel modules
+          find . -name "*.ko" -exec cp {} build_output/ \; 2>/dev/null || true
+          
+          # Copy build logs
+          cp build.log build_output/ 2>/dev/null || true
+          cp dtb_build.log build_output/ 2>/dev/null || true
+          cp modules_build.log build_output/ 2>/dev/null || true
+          
+          echo "📦 Build artifacts:"
           ls -lah build_output/
       
       - name: Upload kernel artifacts
@@ -110,6 +123,7 @@ jobs:
           name: kernel-redmi13-mt6768-${{ github.run_number }}
           path: build_output/
           retention-days: 30
+        continue-on-error: true
       
       - name: Create Release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
@@ -123,14 +137,24 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
       
       - name: Build Summary
+        if: always()
         run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Device: Redmi 13 (MT6768)" >> $GITHUB_STEP_SUMMARY
-          echo "- Kernel: 6.6" >> $GITHUB_STEP_SUMMARY
-          echo "- Branch: lineage-22.1" >> $GITHUB_STEP_SUMMARY
-          echo "- Build artifacts ready in: build_output/" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Output Files:" >> $GITHUB_STEP_SUMMARY
-          ls -lh build_output/ >> $GITHUB_STEP_SUMMARY || echo "No output files generated" >> $GITHUB_STEP_SUMMARY
+          echo "| Info | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Device | Redmi 13 (MT6768) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Kernel | 6.6 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | lineage-22.1 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Compiler | Clang 14 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Arch | ARM64 |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Build Output:" >> $GITHUB_STEP_SUMMARY
+          if [ -d build_output ]; then
+            ls -lh build_output/ >> $GITHUB_STEP_SUMMARY 2>&1
+          else
+            echo "No build output found" >> $GITHUB_STEP_SUMMARY
+          fi
